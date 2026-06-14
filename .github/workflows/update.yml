@@ -1,0 +1,47 @@
+name: Update standings
+
+on:
+  schedule:
+    - cron: "7 * * * *"      # every hour, at 7 minutes past
+  workflow_dispatch:           # lets you trigger it by hand from the Actions tab
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build the standings page
+        env:
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+        run: node generate.js
+
+      - name: Prepare Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the page
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+      - name: Publish to the web
+        id: deployment
+        uses: actions/deploy-pages@v4
