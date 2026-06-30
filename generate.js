@@ -1,5 +1,5 @@
 // Builds the sweepstake standings page from live football-data.org results.
-// Run by GitHub Actions on a schedule. Outputs ./site/index.html
+// Run by GitHub Actions. Outputs ./site/index.html
 const fs = require("fs");
 
 // ---- Your sweepstake (the only things you'd ever edit) --------------------
@@ -37,23 +37,36 @@ const FLAGS = {
   "Portugal":"🇵🇹","United States":"🇺🇸","Algeria":"🇩🇿","Iraq":"🇮🇶","Brazil":"🇧🇷","Ecuador":"🇪🇨","Panama":"🇵🇦","New Zealand":"🇳🇿",
   "Morocco":"🇲🇦","Senegal":"🇸🇳","Ivory Coast":"🇨🇮","Saudi Arabia":"🇸🇦","Netherlands":"🇳🇱","Mexico":"🇲🇽","Czechia":"🇨🇿","Jordan":"🇯🇴",
   "Belgium":"🇧🇪","Uruguay":"🇺🇾","Paraguay":"🇵🇾","Uzbekistan":"🇺🇿","Germany":"🇩🇪","Australia":"🇦🇺","Tunisia":"🇹🇳","Haiti":"🇭🇹",
-  "Croatia":"🇭🇷","South Korea":"🇰🇷","DR Congo":"🇨🇩","Curaçao":"🇨🇼","Colombia":"🇨🇴","Türkiye":"🇹🇷","Scotland":"🏴󠁧󠁢󠁳󠁣󠁴󠁿","Cape Verde":"🇨🇻"
+  "Croatia":"🇭🇷","South Korea":"🇰🇷","DR Congo":"🇨🇩","Curaçao":"🇨🇼","Colombia":"🇨🇴","Türkiye":"🇹🇷","Scotland":"🏴󠁧󠁢󠁳󠁣󠁤󠁿","Cape Verde":"🇨🇻"
 };
 
-// ---- Name matching: map the API's spellings to ours ------------------------
+// ---- Name matching: tolerant of the feed's spelling variants --------------
 const norm = s => String(s).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]/g,"");
+const CANON = Object.values(GROUPS).flat();
+const CANON_NORM = CANON.map(t => [norm(t), t]);
 const NMAP = {};
-Object.values(GROUPS).flat().forEach(t => { NMAP[norm(t)] = t; });
-[ // API alternate spelling -> our name
-  ["korea republic","South Korea"],["republic of korea","South Korea"],["south korea","South Korea"],["korea dpr","North Korea"],
+CANON.forEach(t => { NMAP[norm(t)] = t; });
+[ // feed spelling -> our name
+  ["korea republic","South Korea"],["republic of korea","South Korea"],["south korea","South Korea"],
   ["cote divoire","Ivory Coast"],["côte d'ivoire","Ivory Coast"],["ivory coast","Ivory Coast"],
   ["czech republic","Czechia"],["turkey","Türkiye"],["turkiye","Türkiye"],
   ["bosnia and herzegovina","Bosnia & Herzegovina"],["bosnia-herzegovina","Bosnia & Herzegovina"],
   ["dr congo","DR Congo"],["congo dr","DR Congo"],["democratic republic of the congo","DR Congo"],["congo democratic republic","DR Congo"],
   ["united states","United States"],["usa","United States"],["united states of america","United States"],
-  ["cabo verde","Cape Verde"],["cape verde","Cape Verde"],["curacao","Curaçao"]
+  ["cabo verde","Cape Verde"],["cape verde","Cape Verde"],["cape verde islands","Cape Verde"],
+  ["curacao","Curaçao"],["ir iran","Iran"],["iran islamic republic","Iran"],["islamic republic of iran","Iran"],
+  ["korea dpr","__ignore__"],["north korea","__ignore__"]
 ].forEach(([k,v]) => { NMAP[norm(k)] = v; });
-const resolve = name => NMAP[norm(name)] || null;
+
+function resolve(name){
+  if(!name) return null;
+  const k = norm(name);
+  if(NMAP[k]) return NMAP[k]==="__ignore__" ? null : NMAP[k];
+  // fallback: unique canonical whose key is contained in (or contains) the feed name
+  const hits = CANON_NORM.filter(([cn]) => k.includes(cn) || cn.includes(k));
+  if(hits.length === 1) return hits[0][1];
+  return null;
+}
 
 // ---- helpers --------------------------------------------------------------
 const TEAM_OWNER = {}; const ALL_TEAMS = [];
@@ -66,8 +79,8 @@ const gdtxt = n => n>0?("+"+n):(""+n);
 const gdcls = n => n>0?"pos":(n<0?"neg":"");
 const pairKey = (x,y) => [x,y].sort().join("__");
 const DAYS=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"], MONS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-function nz(iso){ // NZ standard time = UTC+12 (June/July)
-  const d = new Date(new Date(iso).getTime() + 12*3600*1000);
+function nz(iso){
+  const d = new Date(new Date(iso).getTime() + 12*3600*1000); // NZST = UTC+12 (June/July)
   const hh=("0"+d.getUTCHours()).slice(-2), mm=("0"+d.getUTCMinutes()).slice(-2);
   return { date:DAYS[d.getUTCDay()]+" "+d.getUTCDate()+" "+MONS[d.getUTCMonth()], time:hh+":"+mm,
            ymd:d.getUTCFullYear()+"-"+(d.getUTCMonth()+1)+"-"+d.getUTCDate(), full:DAYS[d.getUTCDay()]+" "+d.getUTCDate()+" "+MONS[d.getUTCMonth()]+", "+hh+":"+mm+" NZST" };
@@ -86,37 +99,41 @@ async function main(){
   const matches = (data && data.matches) || [];
   console.log("Fetched", matches.length, "matches from football-data.org");
 
-  // ---- shape the data
-  const SCHED = {};            // pairKey -> utcDate (group + knockout)
-  const RESBYPAIR = {};        // pairKey -> {home, away, hg, ag}
-  const finished = [];         // {home, away, hg, ag, win, stage, utc}
-  const knockouts = [];        // finished/scheduled knockout matches
+  const SCHED = {};        // pairKey -> utcDate (only when both teams resolved)
+  const RESBYPAIR = {};    // pairKey -> {home, away, hg, ag}
+  const credit = [];       // {H, A, hg, ag, win}  (either side may be null)
+  const knockouts = [];
   const unknown = new Set();
+  let groupPlayed = 0, groupGoals = 0, skipped = 0;
+
   matches.forEach(m => {
-    const H = resolve(m.homeTeam && m.homeTeam.name), A = resolve(m.awayTeam && m.awayTeam.name);
-    if(!H){ if(m.homeTeam&&m.homeTeam.name) unknown.add(m.homeTeam.name); }
-    if(!A){ if(m.awayTeam&&m.awayTeam.name) unknown.add(m.awayTeam.name); }
-    if(!H||!A) return;
+    const Hraw = m.homeTeam && m.homeTeam.name, Araw = m.awayTeam && m.awayTeam.name;
+    const H = resolve(Hraw), A = resolve(Araw);
+    if(!H && Hraw) unknown.add(Hraw);
+    if(!A && Araw) unknown.add(Araw);
     const isGroup = (m.stage||"").toUpperCase()==="GROUP_STAGE";
-    if(m.utcDate) SCHED[pairKey(H,A)] = m.utcDate;
     const ft = (m.score && m.score.fullTime) || {};
     const done = m.status==="FINISHED" && ft.home!=null && ft.away!=null;
+    if(m.utcDate && H && A) SCHED[pairKey(H,A)] = m.utcDate;
     if(done){
-      let win = m.score.winner==="HOME_TEAM"?"H":m.score.winner==="AWAY_TEAM"?"A":m.score.winner==="DRAW"?"D":(ft.home>ft.away?"H":ft.away>ft.home?"A":"D");
-      RESBYPAIR[pairKey(H,A)] = {home:H,away:A,hg:ft.home,ag:ft.away};
-      finished.push({home:H,away:A,hg:ft.home,ag:ft.away,win:win,stage:m.stage,utc:m.utcDate});
+      const win = m.score.winner==="HOME_TEAM"?"H":m.score.winner==="AWAY_TEAM"?"A":m.score.winner==="DRAW"?"D":(ft.home>ft.away?"H":ft.away>ft.home?"A":"D");
+      credit.push({H,A,hg:ft.home,ag:ft.away,win});
+      if(H && A) RESBYPAIR[pairKey(H,A)] = {home:H,away:A,hg:ft.home,ag:ft.away};
+      if(isGroup){ groupPlayed++; groupGoals += ft.home+ft.away; }
+      if(!H || !A) skipped++;
     }
-    if(!isGroup) knockouts.push({home:H,away:A,utc:m.utcDate,stage:m.stage,
-      score: done? {hg:ft.home,ag:ft.away}:null });
+    if(!isGroup && H && A) knockouts.push({home:H,away:A,utc:m.utcDate,stage:m.stage,score: done?{hg:ft.home,ag:ft.away}:null});
   });
-  if(unknown.size) console.warn("WARNING: unmapped team names (add to NMAP):", [...unknown].join(", "));
+  if(unknown.size) console.warn("WARNING: these feed names did not match any team — add them to NMAP:", JSON.stringify([...unknown]));
+  if(skipped) console.warn("NOTE:", skipped, "finished match(es) had one unmatched side; the matched team was still credited.");
 
-  // ---- standings
+  // ---- standings (credit each resolved side independently) ----------------
   const TS = {}; ALL_TEAMS.forEach(n => TS[n]={p:0,w:0,d:0,l:0,gf:0,ga:0,pts:0});
-  finished.forEach(m => {
-    const a=TS[m.home], b=TS[m.away]; if(!a||!b) return;
-    a.p++;b.p++; a.gf+=m.hg;a.ga+=m.ag; b.gf+=m.ag;b.ga+=m.hg;
-    if(m.win==="H"){a.w++;a.pts+=3;b.l++;} else if(m.win==="A"){b.w++;b.pts+=3;a.l++;} else {a.d++;b.d++;a.pts++;b.pts++;}
+  credit.forEach(m => {
+    if(m.H && TS[m.H]){ const a=TS[m.H]; a.p++; a.gf+=m.hg; a.ga+=m.ag;
+      if(m.win==="H"){a.w++;a.pts+=3;} else if(m.win==="A"){a.l++;} else {a.d++;a.pts++;} }
+    if(m.A && TS[m.A]){ const b=TS[m.A]; b.p++; b.gf+=m.ag; b.ga+=m.hg;
+      if(m.win==="A"){b.w++;b.pts+=3;} else if(m.win==="H"){b.l++;} else {b.d++;b.pts++;} }
   });
   const owners = SQUADS.map(s => {
     const r={p:0,w:0,d:0,l:0,gf:0,ga:0,pts:0};
@@ -124,9 +141,6 @@ async function main(){
     return {owner:s.owner,teams:s.teams,...r,gd:r.gf-r.ga};
   }).sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||a.owner.localeCompare(b.owner));
 
-  const groupFinished = finished.filter(m=>(m.stage||"").toUpperCase()==="GROUP_STAGE");
-  const played = groupFinished.length;
-  const goals = groupFinished.reduce((s,m)=>s+m.hg+m.ag,0);
   const TODAY = nz(new Date().toISOString()).ymd;
   const UPDATED = nz(new Date().toISOString()).full;
 
@@ -153,7 +167,7 @@ async function main(){
     `<td class="num">${r.gf}:${r.ga}</td><td class="gd ${gdcls(r.gd)}">${gdtxt(r.gd)}</td><td class="tp">${r.pts}</td></tr>`).join("");
   const teamsHtml = `<div class="card"><table><thead><tr><th class="l">Team</th><th>GF:GA</th><th>GD</th><th>Pts</th></tr></thead><tbody>${teamsRows}</tbody></table></div>`;
 
-  function fixRow(a,b,iso,result){ // result = {sa,sb}|null
+  function fixRow(a,b,iso,result){
     const aw=result&&result.sa>result.sb, bw=result&&result.sb>result.sa, drawn=result&&!aw&&!bw;
     let cls="fix", meta="", right=""; let today=false;
     if(iso && !result && nz(iso).ymd===TODAY){ today=true; cls+=" today"; }
@@ -190,18 +204,17 @@ async function main(){
     knockouts.sort((x,y)=> (new Date(x.utc||0)) - (new Date(y.utc||0)) );
     const rows = knockouts.map(k=>{
       const result = k.score ? {sa:k.score.hg,sb:k.score.ag} : null;
-      const row = fixRow(k.home,k.away,k.utc,result);
-      return row.replace('<div class="meta">', `<div class="meta">${esc(prettyStage(k.stage))} · `);
+      return fixRow(k.home,k.away,k.utc,result).replace('<div class="meta">', `<div class="meta">${esc(prettyStage(k.stage))} · `);
     }).join("");
     knockoutHtml = `<details class="card" open><summary class="ghead"><span class="gl">Knockouts</span>`+
       `<span class="cnt">${knockouts.filter(k=>k.score).length}/${knockouts.length}</span></summary>`+
       `<div class="fixwrap">${rows}</div></details>`;
   }
 
-  const html = PAGE({played, goals, UPDATED, playersHtml, teamsHtml, fixturesHtml, knockoutHtml});
+  const html = PAGE({played:groupPlayed, goals:groupGoals, UPDATED, playersHtml, teamsHtml, fixturesHtml, knockoutHtml});
   fs.mkdirSync("site", {recursive:true});
   fs.writeFileSync("site/index.html", html);
-  console.log("Wrote site/index.html —", html.length, "bytes;", played, "group games played, leader:", owners[0] && owners[0].owner, owners[0] && owners[0].pts+"pts");
+  console.log("Wrote site/index.html —", groupPlayed, "group games,", owners.filter(o=>o.p>0).length, "players on the board; leader:", owners[0] && owners[0].owner, owners[0] && owners[0].pts+"pts");
 }
 
 function PAGE(d){ return `<!doctype html>
@@ -256,7 +269,7 @@ function PAGE(d){ return `<!doctype html>
   <div class="panel" id="p-players">${d.playersHtml}</div>
   <div class="panel" id="p-teams">${d.teamsHtml}</div>
   <div class="panel" id="p-fixtures">${d.fixturesHtml}${d.knockoutHtml}
-    <div class="foot">Kick-off times in NZ time · highlighted games are on today · auto-updates hourly</div></div>
+    <div class="foot">Kick-off times in NZ time · highlighted games are on today · auto-updates regularly</div></div>
 </div>
 <script>
 try{
@@ -272,7 +285,7 @@ try{
     if(isLive){row.classList.add('live');if(m)m.insertAdjacentHTML('beforeend',' <span class="tag live">LIVE</span>');}
     else if(isToday){row.classList.add('today');if(m)m.insertAdjacentHTML('beforeend',' <span class="tag today">TODAY</span>');}
   });
-  var f=document.querySelector('.foot'); if(f)f.textContent='Kick-off times in your local timezone · highlighted games are on today · auto-updates hourly';
+  var f=document.querySelector('.foot'); if(f)f.textContent='Kick-off times in your local timezone · highlighted games are on today · auto-updates regularly';
 }catch(e){}
 </script>
 </body></html>`; }
